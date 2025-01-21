@@ -12,13 +12,6 @@ import onnxruntime as ort
 # 1) 환경 설정
 # ------------------------------
 
-# 폴더 디렉토리 구조
-# 현재 폴더
-# ├── final_onnx.py (현재 파일)
-# ├── yolov11n-face.onnx
-# ├── deepfake_binary_s128_e5_early.onnx
-# └── image.jpg
-
 # base_dir = os.getcwd()   # 현재 작업 디렉토리 (.ipynb 파일과 같은 경로)
 base_dir = os.path.dirname(os.path.abspath(__file__))   # 현재 작업 디렉토리 (.py 파일과 같은 경로)
 
@@ -28,8 +21,8 @@ face_model_path = os.path.join(base_dir, "yolov11n-face.onnx")
 # EfficientNet 분류 모델(.onnx) 경로
 cls_model_path = os.path.join(base_dir, "deepfake_binary_s128_e5_early.onnx")
 
-# 예측 대상 이미지
-test_image_path = os.path.join(base_dir, "fake0006.jpg")
+# 예측 대상 이미지 폴더
+image_folder_path = os.path.join(base_dir, "sample")
 
 # ------------------------------
 # 2) 모델 로드
@@ -38,11 +31,7 @@ test_image_path = os.path.join(base_dir, "fake0006.jpg")
 face_detector = YOLO(face_model_path)
 
 # (b) EfficientNet 분류 모델 로드 (ONNX Runtime 사용)
-# ----------------------------------------------
-#  1) onnxruntime 세션 생성
-# ----------------------------------------------
 cls_session = ort.InferenceSession(cls_model_path, providers=["CPUExecutionProvider"])
-# GPU용 onnxruntime 사용 시, 설치 후 providers=["CUDAExecutionProvider"] 등 설정 가능
 
 # 입력/출력 노드 이름(옵션)
 input_name = cls_session.get_inputs()[0].name
@@ -64,19 +53,15 @@ idx_to_class = {0: "Fake", 1: "Real"}
 # ------------------------------
 # 3) 얼굴 검출 + Crop + 분류 함수
 # ------------------------------
-def detect_and_classify_faces(image_path, detector, onnx_sess, extend_ratio=0.5):
-    """
-    1. YOLO로 얼굴 검출
-    2. 얼굴 박스를 (extend_ratio) 비율만큼 상하좌우 확장
-    3. Crop 후 ONNX 모델(EfficientNet) 예측
-    4. 얼굴이 하나도 없는 경우 -> (선택) 전체 이미지로 분류 + 안내 메시지
-    """
+def detect_and_classify_faces(image_path, detector, onnx_sess, extend_ratio=0.4):
+    results_log = []  # 결과 로그 저장 리스트
+    
     # 원본 이미지 로드
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         print(f"[Error] Cannot read image from {image_path}")
-        return
-    
+        return None, None
+
     height, width, _ = img_bgr.shape
 
     # YOLOv11n-face 추론
@@ -87,102 +72,118 @@ def detect_and_classify_faces(image_path, detector, onnx_sess, extend_ratio=0.5)
     for r in results:
         boxes = r.boxes
         if len(boxes) == 0:
-            continue  # 해당 result에 박스가 전혀 없으면 다음 result 확인
+            continue
 
         for box in boxes:
             detected_any_face = True
 
-            x1, y1, x2, y2 = box.xyxy[0].int().tolist()  # 바운딩박스 좌표
-            conf = box.conf[0].item()
+            x1, y1, x2, y2 = box.xyxy[0].int().tolist()
 
-            # ------------------------------
             # (a) 얼굴 박스 확장
-            # ------------------------------
             face_width = x2 - x1
             face_height = y2 - y1
 
-            # 상단, 하단 확장
-            new_y1 = max(0, y1 - int(face_height * extend_ratio * 0.7))  
-            new_y2 = min(height, y2 + int(face_height * extend_ratio))
+            new_y1 = max(0, y1 - int(face_height * extend_ratio))  
+            new_y2 = min(height, y2 + int(face_height * extend_ratio * 1.2))
 
-            # 좌우 확장
-            extend_w = int(face_width * extend_ratio * 0.7)
+            extend_w = int(face_width * extend_ratio)
             new_x1 = max(0, x1 - extend_w)
             new_x2 = min(width, x2 + extend_w)
 
-            # Crop 영역 (BGR)
             crop_bgr = img_bgr[new_y1:new_y2, new_x1:new_x2]
 
-            # ------------------------------
             # (b) ONNX 분류 모델로 예측
-            # ------------------------------
-            # 1) PIL 변환
+            # 전체 이미지를 RGB로 변환
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(crop_rgb)
-
-            # 2) transform 적용 (torch.Tensor)
-            input_tensor = transform(pil_img).unsqueeze(0)  # shape: (1, 3, 128, 128)
             
-            # 3) onnxruntime에 맞게 numpy 변환
-            input_data = input_tensor.cpu().numpy()  # float32 형태
-
-            # 4) 모델 추론
+            # 전처리 수행
+            input_tensor = transform(pil_img).unsqueeze(0)
+            input_data = input_tensor.cpu().numpy()
+            
+            # ONNX 모델 추론
             outputs = onnx_sess.run(None, {input_name: input_data})
-            # outputs[0]의 shape가 (1, 3)이라 가정 -> argmax로 클래스 인덱스 추출
-            pred_np = outputs[0]  # 첫 번째 Output
-            label_idx = int(np.argmax(pred_np, axis=1)[0])
-
-            # (c) 예측 라벨
+            pred_np = outputs[0]
+            
+            # 소프트맥스 적용
+            softmax_output = np.exp(pred_np) / np.sum(np.exp(pred_np), axis=1, keepdims=True)
+            confidence = float(np.max(softmax_output))
+            label_idx = int(np.argmax(softmax_output, axis=1)[0])
             label_str = idx_to_class.get(label_idx, "Unknown")
-            print(f" - 얼굴 분류 결과: {label_str}")
+            
+            # 결과 로그 추가
+            results_log.append(f"{os.path.basename(image_path)} - Detected Face - Label: {label_str}, Confidence: {confidence:.2f}")
 
-            # ------------------------------
-            # (d) 원본 이미지에 결과 표시
-            # ------------------------------
-            color = (0, 255, 0)  # (B, G, R)
+            # 이미지에 박스 및 텍스트 추가
+            color = (0, 255, 0)
             cv2.rectangle(img_bgr, (new_x1, new_y1), (new_x2, new_y2), color, 2)
-
-            # 텍스트: 분류 결과 + YOLO 검출 confidence
-            text_str = f"{label_str}({conf:.2f})"
+            text_str = f"{label_str}({confidence:.2f})"
             cv2.putText(img_bgr, text_str, (new_x1, new_y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     
-    # ------------------------------
-    # 4) 얼굴 미검출 시 처리
-    # ------------------------------
     if not detected_any_face:
         print("[Info] 얼굴을 감지하지 못했습니다.")
-
-        # (선택) 원본 전체 이미지를 분류 모델에 넣어볼 수도 있음
+        
+        # 전체 이미지를 RGB로 변환
         crop_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(crop_rgb)
-
+        
+        # 전처리 수행
         input_tensor = transform(pil_img).unsqueeze(0)
         input_data = input_tensor.cpu().numpy()
-
+        
+        # ONNX 모델 추론
         outputs = onnx_sess.run(None, {input_name: input_data})
         pred_np = outputs[0]
-        label_idx = int(np.argmax(pred_np, axis=1)[0])
-        label_str = idx_to_class.get(label_idx, "Unknown")
-
-        print(f" - 전체 이미지 분류 결과: {label_str}")
-
-        # (선택) 원본 이미지에 텍스트 표시
-        cv2.putText(img_bgr, f"{label_str} (No Face)", (30, 30),
+        
+        # 소프트맥스 적용
+        softmax_output = np.exp(pred_np) / np.sum(np.exp(pred_np), axis=1, keepdims=True)
+        confidence = float(np.max(softmax_output))  # 신뢰도 추출
+        label_idx = int(np.argmax(softmax_output, axis=1)[0])  # 클래스 인덱스 추출
+        label_str = idx_to_class.get(label_idx, "Unknown")  # 클래스 라벨
+        
+        # 결과 로그 추가
+        results_log.append(f"{os.path.basename(image_path)} - Full Image - Label: {label_str}, Confidence: {confidence:.2f}")
+        
+        # 이미지에 텍스트 추가
+        cv2.putText(img_bgr, f"{label_str} (No Face) ({confidence:.2f})", (30, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-    
-    # 최종 결과 이미지 표시
-    cv2.imshow("Face + Classification", img_bgr)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+
+
+    return img_bgr, results_log
 
 # ------------------------------
 # 4) 메인 실행
 # ------------------------------
 if __name__ == "__main__":
-    detect_and_classify_faces(
-        image_path=test_image_path,
-        detector=face_detector,
-        onnx_sess=cls_session,
-        extend_ratio=0.5  # 높이/너비 확장 비율
-    )
+    all_results_log = []
+    image_windows = []
+
+    # sample 폴더 내 모든 이미지 순회                            
+    for filename in os.listdir(image_folder_path):
+        file_path = os.path.join(image_folder_path, filename)
+
+        # 이미지 파일만 처리 (jpg, png 등 확장자 확인)
+        if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            print(f"\n[INFO] Processing file: {filename}")
+            result_img, log = detect_and_classify_faces(
+                image_path=file_path,
+                detector=face_detector,
+                onnx_sess=cls_session,
+                extend_ratio=0.4
+            )
+
+            if result_img is not None and log is not None:
+                all_results_log.extend(log)
+                window_name = f"Result - {filename}"
+                cv2.imshow(window_name, result_img)
+                image_windows.append(window_name)
+
+    # 모든 결과 로그 출력
+    print("\n[Final Results Log]")
+    for log_entry in all_results_log:
+        print(log_entry)
+
+    # 모든 창 닫기 대기
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
